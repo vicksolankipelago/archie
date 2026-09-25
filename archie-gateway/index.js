@@ -3455,6 +3455,9 @@ web.post('/stream', async (req, res) => {
   const child = log.child({ endpoint: 'stream' });
   const text = req.body.text || '';
   const scope = req.body.scope || '';
+  // Optional multimodal input, passed through to the runtime unchanged. The
+  // adapter validates the shape (Pi ImageContent) and 400s on a bad one.
+  const images = Array.isArray(req.body.images) ? req.body.images : undefined;
   if (!text) return res.status(400).json({ ok: false, error: 'text is required' });
   if (!scope) return res.status(400).json({ ok: false, error: 'scope is required' });
 
@@ -3503,7 +3506,7 @@ web.post('/stream', async (req, res) => {
       DISPATCHER_SECRET,
     );
     const body = {
-      input: { prompt: text, runId, sender: event.user || null, trigger: 'user', sessionKey: sessionId, dispatcherToken },
+      input: { prompt: text, runId, sender: event.user || null, trigger: 'user', sessionKey: sessionId, dispatcherToken, ...(images ? { images } : {}) },
     };
 
     // Pipe each Pi adapter SSE event straight to the client. `ev` is already one

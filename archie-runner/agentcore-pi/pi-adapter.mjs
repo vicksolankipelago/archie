@@ -11,6 +11,7 @@ import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { registerBedrock, getModel, runTurn, withModel, pca } from './pi-runtime.mjs';
 import { refreshSessionConfig } from './session-config-refresh.mjs';
+import { normaliseInputImages, INVALID_IMAGES } from './input-images.mjs';
 import { resolveSessionPath, writeIndexEntry } from './session-store.mjs';
 import { outcomeAttributes } from './tool-outcome.mjs';
 import { resolveModelSpec, resolveAllowedTools, buildBuiltinTools, buildCustomTools, readBootstrapContext, makeResourceLoader, resolvePluginManifest, findUnavailablePlugins, resolveMcpPrefixes } from './config-map.mjs';
@@ -144,6 +145,7 @@ const EXPECTED_ACCOUNT = process.env.AGENTCORE_ACCOUNT || null;
 // ever wrote. Pointers are per-key files now and store a basename; see session-store.mjs.
 const SESSION_HEADER = 'x-amzn-bedrock-agentcore-runtime-session-id';
 const DEFAULT_SESSION_ID = 'local-pi-default-session-0000000000000';
+
 // EFS_DIR set only in VPC/EFS mode; else ephemeral /tmp (PUBLIC-mode boot POC).
 const EFS_DIR = process.env.EFS_DIR;
 const SESSIONS_DIR = process.env.PI_SESSIONS_DIR || (EFS_DIR ? join(EFS_DIR, 'sessions') : join(tmpdir(), 'pi-sessions'));
@@ -1386,6 +1388,12 @@ async function handler(req, res) {
       try { body = await readBody(req); } catch (e) { return sendJson(res, e.statusCode || 400, { error: 'invalid JSON body' }); }
       const prompt = body?.input?.prompt ?? body?.prompt;
       if (typeof prompt !== 'string' || prompt.trim() === '') return sendJson(res, 400, { error: 'input.prompt is required and must be a non-empty string' });
+      // Optional multimodal input. Each entry is Pi's ImageContent shape
+      // ({ type:'image', data:<base64>, mimeType }). Validated and normalised
+      // here so a malformed image fails fast rather than deep inside Pi. Absent
+      // or empty → a text-only turn, byte-identical to before.
+      const images = normaliseInputImages(body?.input?.images ?? body?.images);
+      if (images === INVALID_IMAGES) return sendJson(res, 400, { error: 'input.images must be an array of { data, mimeType }' });
       const sessionId = String(req.headers[SESSION_HEADER] || body?.sessionId || DEFAULT_SESSION_ID);
       const stream = wantsStream(req, body);
       // M3 cross-boundary stitch (plan §4.3): adopt the dispatcher's inbound trace context so
@@ -1489,7 +1497,7 @@ async function handler(req, res) {
           const out = await withModel(session, modelOverride, () => runTurn(session, prompt, (ev) => {
             if (ev.type === 'delta') { deltaCount += 1; if (ttftMs === null) ttftMs = Date.now() - tStart; }
             try { res.write(encodeSse(ev)); } catch { /* client gone */ }
-          }));
+          }, images));
           const firstDispatchMs = bedrockMark.firstDispatch();
           bedrockMark.end();
           const cls = classifyTurn(out);
@@ -1514,7 +1522,7 @@ async function handler(req, res) {
         await applyFilter?.(); // re-read grants + shrink the tool surface before the turn snapshots context.tools
         const tSessionReadyBuffered = Date.now(); // see the stream branch — same mark, buffered path
         bedrockMark.begin();
-        const out = await withModel(session, modelOverride, () => runTurn(session, prompt));
+        const out = await withModel(session, modelOverride, () => runTurn(session, prompt, null, images));
         const firstDispatchBufferedMs = bedrockMark.firstDispatch();
         bedrockMark.end();
         const cls = classifyTurn(out);

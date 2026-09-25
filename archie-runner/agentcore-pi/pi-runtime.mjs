@@ -281,7 +281,7 @@ function appendAssistantMessage(completed, message) {
 // terminal `final` event — the caller (adapter) emits that from the returned aggregate, so it
 // can also close the OTEL span with the same numbers. When `onEvent` is omitted, behaviour is
 // driven by `message_end`, with the same message separators as the streamed path.
-export async function runTurn(session, prompt, onEvent) {
+export async function runTurn(session, prompt, onEvent, images = []) {
   // Old saved configurations and cron overrides can bypass the picker. Refuse a Global
   // profile before Pi can send a prompt, including automatic compaction/model requests.
   if (String(session?.model?.id || '').startsWith('global.')) {
@@ -430,7 +430,13 @@ export async function runTurn(session, prompt, onEvent) {
   // shared, per-turn-mutated turnCtx assumes one turn at a time. Re-enabling followUp/steer means
   // revisiting turnCtx and the getSession cache first — see pi-turn-transport-plan.md.
   try {
-    await session.prompt(prompt);
+    // Pi's prompt takes optional image content ({ type:'image', data, mimeType }).
+    // Pass it only when present so a text turn stays byte-identical to before.
+    if (Array.isArray(images) && images.length > 0) {
+      await session.prompt(prompt, { images });
+    } else {
+      await session.prompt(prompt);
+    }
   } finally {
     if (typeof unsub === 'function') unsub();
   }
