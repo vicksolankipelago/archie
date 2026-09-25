@@ -3436,6 +3436,93 @@ web.post('/simulate', async (req, res) => {
   }
 });
 
+// Client streaming endpoint — the operator-surface twin of /simulate, for a
+// desktop/native client (archie-mac) rather than Slack.
+//
+// Same resolve/gate/invoke path as /simulate, but instead of forwarding to the
+// Slack bridge it returns the Pi adapter's SSE events straight to the caller:
+// the exact `delta | tool | final | error` contract from
+// archie-runner/agentcore-pi/sse-contract.mjs, one `data: <json>\n\n` per event.
+//
+// AUTH: operator surface (shared secret via `x-dispatcher-secret`), like
+// /simulate and /reload. It is a human-with-a-client caller, not an agent, so
+// it does not use the token-only agent routes. It cannot spawn a scope Slack
+// cannot (`refuseUnknownScope`).
+//
+//   curl -N -H 'x-dispatcher-secret: ...' -H 'accept: text/event-stream' \
+//        -d '{"scope":"dm-U123","text":"hello"}' http://localhost:19090/stream
+web.post('/stream', async (req, res) => {
+  const child = log.child({ endpoint: 'stream' });
+  const text = req.body.text || '';
+  const scope = req.body.scope || '';
+  if (!text) return res.status(400).json({ ok: false, error: 'text is required' });
+  if (!scope) return res.status(400).json({ ok: false, error: 'scope is required' });
+
+  // Reuse the synthetic-event shape so routing/dedup/gating are identical to
+  // production and /simulate. `slackRefFromScopeId` turns dm-<user>/ch-<channel>
+  // into a typed ref ({ kind:'user'|'channel', id }); map it onto the event
+  // fields resolveAgent keys on.
+  const ref = slackRefFromScopeId(scope);
+  const refUser = ref && ref.kind === 'user' ? ref.id : null;
+  const refChannel = ref && ref.kind === 'channel' ? ref.id : null;
+  const event = {
+    type: 'message',
+    text,
+    user: req.body.user || refUser || 'U_STREAM',
+    channel: req.body.channel || refChannel || 'C_STREAM',
+    channel_type: req.body.channel_type || (String(scope).startsWith('dm-') ? 'im' : 'channel'),
+    ts: `${Math.floor(Date.now() / 1000)}.${String(simulateSeq++).padStart(6, '0')}`,
+  };
+
+  const agent = resolveAgent(event);
+  if (!agent) return res.status(404).json({ ok: false, error: 'no route matched' });
+  if (await refuseUnknownScope(agent)) {
+    child.info({ agent }, 'scope does not exist — refusing to mint (alpha)');
+    return res.status(403).json({ ok: false, error: 'scope does not exist', agent });
+  }
+
+  const sessionId = buildSessionKey(event);
+  const runId = event.user ? `u:${event.user}:${crypto.randomUUID()}` : crypto.randomUUID();
+  child.info({ agent, sessionId }, 'stream turn');
+
+  // SSE headers — mirror sse-contract.mjs SSE_HEADERS.
+  res.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+  });
+  const write = (ev) => { try { res.write(`data: ${JSON.stringify(ev)}\n\n`); } catch { return; } };
+
+  let aborted = false;
+  req.on('close', () => { aborted = true; });
+
+  try {
+    const runtimeArn = await ensureCurrentRuntime(agent, { logger: child });
+    const dispatcherToken = mintTurnToken(
+      { scope: agent, sessionId, runId, expMs: Date.now() + SLACK_TURN_TOKEN_TTL_MS },
+      DISPATCHER_SECRET,
+    );
+    const body = {
+      input: { prompt: text, runId, sender: event.user || null, trigger: 'user', sessionKey: sessionId, dispatcherToken },
+    };
+
+    // Pipe each Pi adapter SSE event straight to the client. `ev` is already one
+    // of { type:'delta'|'tool'|'final'|'error', ... } per sse-contract.mjs.
+    const onChunk = (ev) => { if (!aborted) write(ev); };
+
+    await agentCore.invokeStreaming(runtimeArn, sessionId, body, onChunk, { logger: child, agent, trigger: 'user' });
+  } catch (err) {
+    child.error({ err: err.message, agent }, 'stream invoke failed');
+    if (!res.headersSent) return res.status(502).json({ ok: false, error: err.message });
+    // Headers already flushed: emit error + a terminal final so the client's
+    // contract (exactly one final closes the run) is honoured and it never hangs.
+    write({ type: 'error', message: err.message });
+    write({ type: 'final', text: '', usage: null, model: null, stopReason: 'error' });
+  } finally {
+    if (!res.writableEnded) res.end();
+  }
+});
+
 // Hot reload: pull the config repo and rebuild routes without restarting
 // the Slack connection. Serialised by the reload mutex (fix 3), so
 // overlapping requests wait instead of racing on the clone dir.
