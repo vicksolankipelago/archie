@@ -49,6 +49,7 @@ const { mintTurnToken, claimsOf } = require('./turn-token');
 const { createTurnTokenStore } = require('./turn-token-store');
 const { createDispatcherAuth } = require('./dispatcher-auth');
 const { createSpawnApi } = require('./spawn-api');
+const { createClientApi } = require('./client-api');
 const { makeApprovalHandlers, registerApprovalRoutes } = require('./approvals-routes');
 const { registerSlackProxyRoute } = require('./slack-proxy-routes');
 const { createApprovalWake } = require('./approvals-wake');
@@ -3240,9 +3241,28 @@ web.use('/admin/cron', dispatcherAuth.requireAdminSecret, createCronApi({
 web.use(dispatcherAuth.authenticate);
 web.use(dispatcherAuth.enforceScope);
 // Agent routes are TOKEN-ONLY from here. The fleet-wide secret still authenticates the OPERATOR
-// surface (/reload, /simulate, /routes, /debug/streaming) — those callers are people and CI, they
-// have no turn, and there is no token for them to hold.
+// surface (/reload, /simulate, /routes, /debug/streaming, /client) — those callers are people and
+// CI, they have no turn, and there is no token for them to hold.
 web.use(dispatcherAuth.AGENT_ROUTE_PREFIXES, dispatcherAuth.requireToken);
+
+// Operator control API for a native client (archie-mac). Mounted on the operator
+// surface: `authenticate` above has already accepted the shared secret, and
+// /client is deliberately NOT in AGENT_ROUTE_PREFIXES, so it takes the operator
+// credential rather than a per-turn token. `requireOperator` additionally
+// rejects a token-authed caller, so an agent cannot reach it even if it holds a
+// valid token — the scope here is named in the path, not derived from a
+// signature, which only an operator may do.
+const requireOperator = (req, res, next) => {
+  if (req.dispatcherAuth && req.dispatcherAuth.kind === 'token') {
+    return res.status(403).json({ ok: false, error: 'operator credential required' });
+  }
+  next();
+};
+web.use('/client', createClientApi({
+  requireOperator,
+  grants, approvalsStore, cronService, filesStore, owners, marketplace,
+  log,
+}).router);
 
 // `POST /spawn` — sessions_spawn's server half (archie-sessions-spawn-plan.md). Token-only like every
 // other agent route, and it reads NO identity from the body: the scope comes from the signature, so
